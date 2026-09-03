@@ -29,6 +29,7 @@ import base64
 
 from src.auth.iam_signer_credentials_service import IamSignerCredentials
 from src.common.base_dto import (
+    AspectRatioEnum,
     GenerationModelEnum,
     MimeTypeEnum,
     ReferenceImageTypeEnum,
@@ -36,6 +37,7 @@ from src.common.base_dto import (
 from src.common.media_utils import (
     concatenate_videos,
     generate_thumbnail,
+    get_video_metadata,
     strip_audio,
 )
 from src.common.schema.genai_model_setup import GenAIModelSetup
@@ -55,8 +57,14 @@ from src.source_assets.repository.source_asset_repository import (
     SourceAssetRepository,
 )
 from src.users.user_model import UserModel
+from src.workspaces.repository.workspace_repository import WorkspaceRepository
 from src.videos.dto.concatenate_videos_dto import ConcatenateVideosDto
-from src.videos.dto.create_veo_dto import OMNI_MODELS, CreateVeoDto
+from src.videos.dto.create_veo_dto import (
+    OMNI_1_0_MODELS,
+    OMNI_1_1_MODELS,
+    OMNI_MODELS,
+    CreateVeoDto,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +72,158 @@ VIDEO_RESOLUTION_MAP = {
     "1K": "720p",
     "2K": "1080p",
     "4K": "4k",
+    "360p": "360p",
+    "720p": "720p",
+    "1080p": "1080p",
 }
+
+# Ceilings on the long edge for each name in VIDEO_RESOLUTION_MAP, used to name
+# a frame size that was measured rather than requested. The long edge is what
+# the names refer to: a 720x1280 portrait clip is the same 1K as its 1280x720
+# landscape counterpart. Anything larger is 4K.
+MEASURED_RESOLUTION_BY_LONG_EDGE = (
+    (640, "360p"),
+    (1280, "1K"),
+    (1920, "2K"),
+)
+
+# How far a measured ratio may sit from a named one and still be called by that
+# name. Encoders round frame sizes up to whole macroblocks - 1920x1088 rather
+# than 1920x1080 - which shifts the ratio by well under a percent.
+ASPECT_RATIO_TOLERANCE = 0.02
+
+# A Veo operation is polled until it reports done, and nothing says it ever
+# will. Background jobs of every kind share one four-thread executor, so a poll
+# loop with no ceiling eventually takes the whole pool with it, and the row it
+# belongs to sits in `processing` for good.
+VEO_POLL_TIMEOUT_SECONDS = 1800.0
+
+
+def resolve_measured_resolution(width: int, height: int) -> str:
+    """Names a measured frame size in the vocabulary the request uses.
+
+    Args:
+        width: Measured frame width in pixels.
+        height: Measured frame height in pixels.
+
+    Returns:
+        One of the resolution names a request can ask for ("1K", "2K", "4K").
+
+    """
+    long_edge = max(width, height)
+    for ceiling, name in MEASURED_RESOLUTION_BY_LONG_EDGE:
+        if long_edge <= ceiling:
+            return name
+    return "4K"
+
+
+def resolve_measured_aspect_ratio(
+    width: int,
+    height: int,
+) -> AspectRatioEnum | None:
+    """Names a measured frame size as one of the supported aspect ratios.
+
+    Args:
+        width: Measured frame width in pixels.
+        height: Measured frame height in pixels.
+
+    Returns:
+        The closest supported ratio, or None when the frame resembles none of
+        them - the caller then keeps the ratio the row already holds, which is
+        of more use to a reader than OTHER.
+
+    """
+    if width <= 0 or height <= 0:
+        return None
+
+    measured = width / height
+    closest: AspectRatioEnum | None = None
+    smallest_error = ASPECT_RATIO_TOLERANCE
+    for candidate in AspectRatioEnum:
+        parts = candidate.value.split(":")
+        if len(parts) != 2:
+            continue
+        ratio = int(parts[0]) / int(parts[1])
+        error = abs(measured - ratio) / ratio
+        if error < smallest_error:
+            closest = candidate
+            smallest_error = error
+    return closest
+
+
+def build_measured_metadata(video_path: str) -> dict:
+    """Describes a delivered clip from the file itself.
+
+    The row is otherwise a copy of the request, which the output need not
+    match: an extension is asked for 7 seconds whatever the form said, an edit
+    inherits the length and dimensions of the clip it modifies, and Omni is
+    never told a resolution at all.
+
+    Blocking: call from a worker thread.
+
+    Args:
+        video_path: Path to a local copy of the delivered clip.
+
+    Returns:
+        The subset of "duration_seconds", "aspect_ratio" and "resolution" that
+        could be measured, ready to merge into an update. Empty when the file
+        cannot be probed, so nothing overwrites the request values with
+        guesses.
+
+    """
+    probed = get_video_metadata(video_path)
+    if not probed:
+        return {}
+
+    measured: dict = {}
+    duration_seconds = probed.get("duration_seconds")
+    if duration_seconds:
+        measured["duration_seconds"] = duration_seconds
+
+    width = probed.get("width") or 0
+    height = probed.get("height") or 0
+    if width > 0 and height > 0:
+        measured["resolution"] = resolve_measured_resolution(width, height)
+        aspect_ratio = resolve_measured_aspect_ratio(width, height)
+        if aspect_ratio:
+            measured["aspect_ratio"] = aspect_ratio
+
+    return measured
+
+
+async def record_worker_progress(
+    media_repo: MediaRepository,
+    media_item_id: int,
+    worker_logger: logging.Logger,
+    progress: dict | None = None,
+) -> None:
+    """Stamps a sign of life on an in-flight job's row.
+
+    A generation runs for minutes with nothing written to its row until it
+    finishes, so a job being worked on and one whose worker died look
+    identical: both sit in `processing` with the timestamps they were queued
+    with. There is no heartbeat column, but every write bumps `updated_at`,
+    which is enough to tell the two apart.
+
+    The write is best effort - a database hiccup here must not abandon a
+    generation that is otherwise going fine.
+
+    Args:
+        media_repo: Repository owning the job's media item.
+        media_item_id: The row to stamp.
+        worker_logger: The logger belonging to this job's worker.
+        progress: Columns to write alongside the stamp, if there are any.
+
+    """
+    try:
+        await media_repo.update(media_item_id, progress or {})
+    except Exception as e:  # noqa: BLE001 - liveness must not fail the job
+        worker_logger.warning(
+            "Could not record progress for media item %s: %s",
+            media_item_id,
+            e,
+        )
+
 
 # --- GEMINI OMNI (INTERACTIONS API) HELPERS ---
 
@@ -75,6 +234,7 @@ OMNI_TASK_TEXT_TO_VIDEO = "text_to_video"
 OMNI_TASK_IMAGE_TO_VIDEO = "image_to_video"
 OMNI_TASK_REFERENCE_TO_VIDEO = "reference_to_video"
 OMNI_TASK_EDIT = "edit"
+OMNI_TASK_EXTEND = "extend"
 
 # Generation can run well over a minute. Without a ceiling a stalled request
 # holds one of the shared executor's threads for the life of the process.
@@ -86,17 +246,17 @@ def resolve_omni_task(
     is_edit: bool,
     has_references: bool,
     has_start_image: bool,
+    has_end_image: bool = False,
+    has_source_video: bool = False,
 ) -> str:
     """Picks the explicit Omni task mode for a request.
 
-    Order matters: an edit stays an edit even when references are attached, and
-    a start image outranks references. Both can be sent together — Omni has no
-    typed reference field, so every image rides the multimodal input — but only
-    image_to_video treats the first image as the opening frame. Choosing
-    reference_to_video there would demote a deliberately chosen frame to one
-    more reference and lose the anchor, which is the whole point of supplying
-    it. Verified live: image_to_video with a frame plus a character sheet held
-    the frame as frame 1 and still carried the reference likeness.
+    Order matters: an edit stays an edit even when references are attached, an
+    extension stays an extension, and a start/end image outranks references.
+    Both can be sent together — Omni has no typed reference field, so every
+    image rides the multimodal input — but only image_to_video treats the
+    images as keyframes. Choosing reference_to_video there would demote a
+    deliberately chosen frame to one more reference and lose the anchor.
 
     The caller omits the task entirely when replaying a prior conversation's
     steps, following Google's Vertex sample — the replayed steps already carry
@@ -104,7 +264,9 @@ def resolve_omni_task(
     """
     if is_edit:
         return OMNI_TASK_EDIT
-    if has_start_image:
+    if has_source_video:
+        return OMNI_TASK_EXTEND
+    if has_start_image or has_end_image:
         return OMNI_TASK_IMAGE_TO_VIDEO
     if has_references:
         return OMNI_TASK_REFERENCE_TO_VIDEO
@@ -116,12 +278,14 @@ def build_omni_response_format(
     aspect_ratio: str | None,
     duration_seconds: int | None,
     gcs_output_directory: str,
+    resolution: str | None = None,
 ) -> dict:
     """Builds the response_format block for an Omni interaction.
 
     Aspect ratio and duration are both omitted for edits, which inherit the
     dimensions and length of the clip being modified. Sending either is
     rejected: "Aspect ratio cannot be set in response format for edit task."
+    Resolution can be specified for Omni 1.1 (e.g. 360p, 720p, 1080p, 4k).
     """
     response_format: dict = {
         "type": "video",
@@ -134,6 +298,21 @@ def build_omni_response_format(
         response_format["aspect_ratio"] = aspect_ratio
     if duration_seconds is not None:
         response_format["duration"] = f"{duration_seconds}s"
+    if resolution is not None:
+        res_map = {
+            "1K": "720p",
+            "1k": "720p",
+            "720p": "720p",
+            "2K": "1080p",
+            "2k": "1080p",
+            "1080p": "1080p",
+            "4K": "4k",
+            "4k": "4k",
+            "360p": "360p",
+        }
+        response_format["resolution"] = res_map.get(
+            resolution, resolution.lower()
+        )
     return response_format
 
 
@@ -348,12 +527,46 @@ def _process_video_in_background(
                         brand_guideline_repo=brand_guideline_repo,
                     )
 
-                    gcs_service = GcsService()
+                    workspace_repo = WorkspaceRepository(db)
+                    target_project_id: str | None = None
+                    target_bucket_name: str | None = None
+                    if request_dto.workspace_id:
+                        try:
+                            ws = await workspace_repo.get_by_id(
+                                request_dto.workspace_id
+                            )
+                            if ws:
+                                target_project_id = ws.gcp_project_id
+                                target_bucket_name = ws.gcs_bucket_name
+                        except Exception as e:
+                            worker_logger.warning(
+                                "Could not fetch workspace config: %s", e
+                            )
+
+                    gcs_service = GcsService(
+                        bucket_name=target_bucket_name,
+                        project_id=target_project_id,
+                    )
 
                     try:
-                        client = GenAIModelSetup.init()
+                        # The row's created_at is when the job was queued, and
+                        # under a busy executor that can be long before a
+                        # thread picks it up. Stamping it here records when the
+                        # work actually started.
+                        await record_worker_progress(
+                            media_repo,
+                            media_item_id,
+                            worker_logger,
+                        )
+
+                        client = GenAIModelSetup.init(
+                            project_id=target_project_id
+                        )
                         cfg = config_service
-                        gcs_output_directory = f"gs://{cfg.GENMEDIA_BUCKET}"
+                        effective_bucket = (
+                            target_bucket_name or cfg.GENMEDIA_BUCKET
+                        )
+                        gcs_output_directory = f"gs://{effective_bucket}"
 
                         if request_dto.enhance_prompt:
                             rewritten_prompt = (
@@ -576,6 +789,7 @@ def _process_video_in_background(
                         permanent_thumbnail_gcs_uris = []
                         final_gcs_uris = []
                         raw_data_dict = None
+                        measured_metadata: dict = {}
                         model_name_for_api = request_dto.generation_model.value
 
                         start_time = time.monotonic()
@@ -584,19 +798,29 @@ def _process_video_in_background(
                             worker_logger.info(
                                 "Running Gemini Omni video generation via Interactions API..."
                             )
-                            vertex_client = GenAIModelSetup.get_omni_client()
+                            vertex_client = GenAIModelSetup.get_omni_client(
+                                project_id=target_project_id
+                            )
 
                             interaction_id = None
                             thought_signature = None
 
-                            # Resolve the reference video URI and its real mime
-                            # type. Audio references are rejected upstream by
+                            # Resolve reference video URIs and their mime types.
+                            # Audio references are rejected upstream by
                             # CreateVeoDto: Omni accepts an audio part and then
                             # ignores it, so there is nothing to resolve here.
-                            ref_video_uri = None
-                            ref_video_mime_type = None
-                            if request_dto.reference_video:
-                                ref = request_dto.reference_video
+                            all_ref_videos = []
+                            if request_dto.reference_videos:
+                                all_ref_videos.extend(
+                                    request_dto.reference_videos
+                                )
+                            elif request_dto.reference_video:
+                                all_ref_videos.append(
+                                    request_dto.reference_video
+                                )
+
+                            ref_videos_for_api: list[tuple[str, str]] = []
+                            for ref in all_ref_videos:
                                 if ref.type == "media_item":
                                     parent_item = await media_repo.get_by_id(
                                         ref.id
@@ -609,11 +833,12 @@ def _process_video_in_background(
                                             < len(parent_item.gcs_uris)
                                         ):
                                             index = 0
-                                        ref_video_uri = parent_item.gcs_uris[
-                                            index
-                                        ]
-                                        ref_video_mime_type = (
-                                            parent_item.mime_type
+                                        ref_videos_for_api.append(
+                                            (
+                                                parent_item.gcs_uris[index],
+                                                parent_item.mime_type
+                                                or MimeTypeEnum.VIDEO_MP4.value,
+                                            )
                                         )
                                 else:
                                     video_asset = (
@@ -621,10 +846,13 @@ def _process_video_in_background(
                                             ref.id
                                         )
                                     )
-                                    if video_asset:
-                                        ref_video_uri = video_asset.gcs_uri
-                                        ref_video_mime_type = (
-                                            video_asset.mime_type
+                                    if video_asset and video_asset.gcs_uri:
+                                        ref_videos_for_api.append(
+                                            (
+                                                video_asset.gcs_uri,
+                                                video_asset.mime_type
+                                                or MimeTypeEnum.VIDEO_MP4.value,
+                                            )
                                         )
 
                             # --- Continue from a previous clip, if asked ---
@@ -718,9 +946,12 @@ def _process_video_in_background(
                             omni_task = resolve_omni_task(
                                 is_edit=is_edit,
                                 has_references=bool(
-                                    reference_images_for_api or ref_video_uri
+                                    reference_images_for_api
+                                    or ref_videos_for_api
                                 ),
                                 has_start_image=bool(start_image_for_api),
+                                has_end_image=bool(end_image_for_api),
+                                has_source_video=bool(source_video_for_api),
                             )
 
                             if is_followup:
@@ -789,6 +1020,35 @@ def _process_video_in_background(
                                         "uri": edit_source_uri,
                                     }
                                 )
+                            elif (
+                                omni_task == OMNI_TASK_EXTEND
+                                and source_video_for_api
+                            ):
+                                worker_logger.info(
+                                    "Extending video %s with Gemini Omni (task=%s)",
+                                    source_video_for_api.uri,
+                                    omni_task,
+                                )
+                                omni_inputs = [
+                                    {
+                                        "type": "text",
+                                        "text": request_dto.prompt,
+                                    },
+                                    {
+                                        "type": "video",
+                                        "mime_type": source_video_for_api.mime_type
+                                        or MimeTypeEnum.VIDEO_MP4.value,
+                                        "uri": source_video_for_api.uri,
+                                    },
+                                ]
+                                for ref_img in reference_images_for_api:
+                                    omni_inputs.append(
+                                        {
+                                            "type": "image",
+                                            "mime_type": ref_img.image.mime_type,
+                                            "uri": ref_img.image.gcs_uri,
+                                        }
+                                    )
                             else:
                                 worker_logger.info(
                                     "Starting Gemini Omni generation (task=%s)",
@@ -799,11 +1059,7 @@ def _process_video_in_background(
                                 # combining the two, so ordering is unambiguous.
                                 # The prompt is passed through verbatim. Users
                                 # can bind specific images to roles with
-                                # <FIRST_FRAME> and <IMAGE_REF_N> tags, which
-                                # are honoured on Vertex (verified: tagged
-                                # prompts produced the requested cross-pairing
-                                # while an untagged control paired adjacently).
-                                # Rewriting the prompt here would break them.
+                                # <FIRST_FRAME>, <LAST_FRAME>, and <IMAGE_REF_N> tags.
                                 omni_inputs = [
                                     {
                                         "type": "text",
@@ -820,6 +1076,15 @@ def _process_video_in_background(
                                         }
                                     )
 
+                                if end_image_for_api:
+                                    omni_inputs.append(
+                                        {
+                                            "type": "image",
+                                            "mime_type": end_image_for_api.mime_type,
+                                            "uri": end_image_for_api.gcs_uri,
+                                        }
+                                    )
+
                                 for ref_img in reference_images_for_api:
                                     omni_inputs.append(
                                         {
@@ -829,22 +1094,33 @@ def _process_video_in_background(
                                         }
                                     )
 
-                                if ref_video_uri:
+                                for (
+                                    ref_uri,
+                                    ref_mime,
+                                ) in ref_videos_for_api:
                                     omni_inputs.append(
                                         {
                                             "type": "video",
-                                            "mime_type": ref_video_mime_type
+                                            "mime_type": ref_mime
                                             or MimeTypeEnum.VIDEO_MP4.value,
-                                            "uri": ref_video_uri,
+                                            "uri": ref_uri,
                                         }
                                     )
 
-                            # An edit inherits both dimensions and length from
-                            # the clip it modifies; the API rejects either.
+                            # An edit inherits dimensions and length from the
+                            # clip it modifies; an extension inherits aspect ratio.
+                            req_resolution = (
+                                request_dto.resolution
+                                if request_dto.generation_model
+                                in OMNI_1_1_MODELS
+                                else None
+                            )
                             omni_response_format = build_omni_response_format(
                                 aspect_ratio=(
                                     None
-                                    if is_edit
+                                    if (
+                                        is_edit or omni_task == OMNI_TASK_EXTEND
+                                    )
                                     else request_dto.aspect_ratio.value
                                 ),
                                 duration_seconds=(
@@ -853,6 +1129,7 @@ def _process_video_in_background(
                                     else request_dto.duration_seconds
                                 ),
                                 gcs_output_directory=gcs_output_directory,
+                                resolution=req_resolution,
                             )
 
                             final_gcs_uris = []
@@ -1001,6 +1278,17 @@ def _process_video_in_background(
                                         "output with neither data nor uri.",
                                     )
 
+                                # Measure the clip while a local copy is still
+                                # around. Omni is told no resolution, and an
+                                # edit is told neither dimensions nor length,
+                                # so the request describes none of this.
+                                clip_metadata: dict = {}
+                                if os.path.exists(local_output_path):
+                                    clip_metadata = await asyncio.to_thread(
+                                        build_measured_metadata,
+                                        local_output_path,
+                                    )
+
                                 # Generate local thumbnail
                                 thumbnail_path = None
                                 if os.path.exists(local_output_path):
@@ -1049,6 +1337,7 @@ def _process_video_in_background(
                                     thumbnail_gcs_uri,
                                     interaction_id,
                                     serialize_omni_steps(interaction.steps),
+                                    clip_metadata,
                                 )
 
                             tasks = [
@@ -1062,6 +1351,7 @@ def _process_video_in_background(
                                 thumbnail_gcs_uri,
                                 interaction_id,
                                 interaction_steps,
+                                clip_metadata,
                             ) in parallel_results:
                                 final_gcs_uris.append(final_gcs_uri)
                                 permanent_thumbnail_gcs_uris.append(
@@ -1076,6 +1366,12 @@ def _process_video_in_background(
                                         "interaction_id": interaction_id,
                                         "steps": interaction_steps,
                                     },
+                                )
+                                # Every clip of one job is generated from the
+                                # same response format, so the first one that
+                                # could be measured describes the row.
+                                measured_metadata = (
+                                    measured_metadata or clip_metadata
                                 )
 
                             raw_data_dict = {
@@ -1119,8 +1415,35 @@ def _process_video_in_background(
                                 )
                             )
 
+                            # Keep the operation on the row before waiting on
+                            # it. If this worker dies the row is all that is
+                            # left, and without the name there is no way to ask
+                            # Vertex what became of the job or to collect a
+                            # video it may have written in the meantime.
+                            await record_worker_progress(
+                                media_repo,
+                                media_item_id,
+                                worker_logger,
+                                {
+                                    "raw_data": {
+                                        "operation_name": operation.name
+                                    }
+                                },
+                            )
+
                             # Poll the operation status until the video is ready
+                            polling_started = time.monotonic()
                             while not operation.done:
+                                if (
+                                    time.monotonic() - polling_started
+                                    >= VEO_POLL_TIMEOUT_SECONDS
+                                ):
+                                    raise TimeoutError(
+                                        "Video generation operation "
+                                        f"{operation.name} was still running "
+                                        f"after {VEO_POLL_TIMEOUT_SECONDS:.0f}"
+                                        " seconds and was given up on.",
+                                    )
                                 worker_logger.info(
                                     "Waiting for video generation to complete, polling video generation status...",
                                     extra={
@@ -1135,6 +1458,13 @@ def _process_video_in_background(
                                     client.operations.get,
                                     operation,
                                 )
+                                # A poll that came back is the only evidence
+                                # anyone gets that this job is still alive.
+                                await record_worker_progress(
+                                    media_repo,
+                                    media_item_id,
+                                    worker_logger,
+                                )
 
                             if operation.error:
                                 raise Exception(operation.error)
@@ -1144,7 +1474,16 @@ def _process_video_in_background(
                                 or not operation.response
                                 or not operation.response.generated_videos
                             ):
-                                return
+                                # Returning here would walk straight past the
+                                # handler below, which is the only thing that
+                                # writes a terminal status, and leave the row
+                                # in `processing` for good. Vertex answers this
+                                # way when the request itself succeeded but
+                                # every candidate was filtered.
+                                raise RuntimeError(
+                                    "Video generation finished without "
+                                    "returning any videos.",
+                                )
 
                             # Download the generated video and create thumbnail
                             thumbnail_path = ""
@@ -1168,13 +1507,32 @@ def _process_video_in_background(
                                         destination_file_path=local_output_path,
                                     )
 
-                                    # Step 2: Generate Thumbnail from the first video frame
+                                    # Step 2: Measure the delivered clip, while
+                                    # the local copy is still around. An
+                                    # extension is asked for 7s whatever the
+                                    # request said, and Veo may return a
+                                    # smaller frame than was asked for.
+                                    if (
+                                        downloaded_video_path
+                                        and os.path.exists(
+                                            downloaded_video_path
+                                        )
+                                    ):
+                                        measured_metadata = (
+                                            measured_metadata
+                                            or await asyncio.to_thread(
+                                                build_measured_metadata,
+                                                downloaded_video_path,
+                                            )
+                                        )
+
+                                    # Step 3: Generate Thumbnail from the first video frame
                                     thumbnail_path = await asyncio.to_thread(
                                         generate_thumbnail,
                                         downloaded_video_path or "",
                                     )
 
-                                    # Step 3: Save the Thumbnail in GCS
+                                    # Step 4: Save the Thumbnail in GCS
                                     if thumbnail_path:
                                         # Get the parent directory of the thumbnail to clean it up later.
                                         temp_dir = os.path.dirname(
@@ -1231,6 +1589,12 @@ def _process_video_in_background(
                             "thumbnail_uris": permanent_thumbnail_gcs_uris,
                             "generation_time": generation_time,
                             "num_media": len(final_gcs_uris),
+                            # Replaces the request values the placeholder was
+                            # built from, which describe what was asked for
+                            # rather than what arrived. Empty when the clip
+                            # could not be probed, and then the request values
+                            # stand as the best guess available.
+                            **measured_metadata,
                         }
                         if raw_data_dict is not None:
                             update_data["raw_data"] = raw_data_dict
@@ -1263,9 +1627,27 @@ def _process_video_in_background(
                             "status": JobStatusEnum.FAILED,
                             "error_message": str(e),
                         }
-                        await media_repo.update(
-                            media_item_id, error_update_data
-                        )
+                        try:
+                            # A statement that failed leaves the session in an
+                            # aborted transaction, and the write below would
+                            # then fail too and leave the job in `processing`
+                            # for good. Every earlier write committed as it
+                            # went, so there is nothing here to lose.
+                            await db.rollback()
+                            await media_repo.update(
+                                media_item_id, error_update_data
+                            )
+                        except Exception as update_error:  # noqa: BLE001
+                            worker_logger.error(
+                                "Could not record the job's failure.",
+                                extra={
+                                    "json_fields": {
+                                        "media_id": media_item_id,
+                                        "error": str(update_error),
+                                    },
+                                },
+                                exc_info=True,
+                            )
 
         loop.run_until_complete(_async_worker())
         loop.close()
@@ -1316,11 +1698,40 @@ def _process_video_concatenation_in_background(
             async with WorkerDatabase() as db_factory:
                 async with db_factory() as db:
                     media_repo = MediaRepository(db)
-                    gcs_service = GcsService()
                     source_asset_repo = SourceAssetRepository(db)
+                    workspace_repo = WorkspaceRepository(db)
                     cfg = config_service
 
+                    target_project_id: str | None = None
+                    target_bucket_name: str | None = None
+                    if request_dto.workspace_id:
+                        try:
+                            ws = await workspace_repo.get_by_id(
+                                request_dto.workspace_id
+                            )
+                            if ws:
+                                target_project_id = ws.gcp_project_id
+                                target_bucket_name = ws.gcs_bucket_name
+                        except Exception as e:
+                            worker_logger.warning(
+                                "Could not fetch workspace config: %s", e
+                            )
+
+                    gcs_service = GcsService(
+                        bucket_name=target_bucket_name,
+                        project_id=target_project_id,
+                    )
+
                     try:
+                        # Same reason as the generation worker: a row queued
+                        # behind three other jobs is otherwise indistinguishable
+                        # from one whose worker never ran.
+                        await record_worker_progress(
+                            media_repo,
+                            media_item_id,
+                            worker_logger,
+                        )
+
                         start_time = time.monotonic()
                         local_video_paths = []
 
@@ -1405,9 +1816,18 @@ def _process_video_concatenation_in_background(
                                 mime_type="image/png",
                             )
 
+                        # 5. Measure the joined clip before its temp directory
+                        # goes. Nothing about the output's length is known up
+                        # front: it is the sum of however long the inputs
+                        # turned out to be.
+                        measured_metadata = await asyncio.to_thread(
+                            build_measured_metadata,
+                            concatenated_path,
+                        )
+
                         end_time = time.monotonic()
 
-                        # 5. Update the placeholder MediaItem
+                        # 6. Update the placeholder MediaItem
                         update_data = {
                             "status": JobStatusEnum.COMPLETED,
                             "gcs_uris": [final_gcs_uri],
@@ -1416,6 +1836,7 @@ def _process_video_concatenation_in_background(
                             ),
                             "generation_time": end_time - start_time,
                             "num_media": 1,
+                            **measured_metadata,
                         }
                         await media_repo.update(media_item_id, update_data)
                         worker_logger.info(
@@ -1431,9 +1852,22 @@ def _process_video_concatenation_in_background(
                             "status": JobStatusEnum.FAILED,
                             "error_message": str(e),
                         }
-                        await media_repo.update(
-                            media_item_id, error_update_data
-                        )
+                        try:
+                            # See the generation worker: without the rollback a
+                            # database failure takes the status write down with
+                            # it and the job never leaves `processing`.
+                            await db.rollback()
+                            await media_repo.update(
+                                media_item_id, error_update_data
+                            )
+                        except Exception as update_error:  # noqa: BLE001
+                            worker_logger.error(
+                                "Could not record the failure on media item "
+                                "%s: %s",
+                                media_item_id,
+                                update_error,
+                                exc_info=True,
+                            )
                     finally:
                         if os.path.exists(temp_dir):
                             shutil.rmtree(temp_dir)
@@ -1549,8 +1983,13 @@ class VeoService:
                     ),
                 )
 
-        if request_dto.reference_video:
-            ref = request_dto.reference_video
+        all_ref_videos = []
+        if request_dto.reference_videos:
+            all_ref_videos.extend(request_dto.reference_videos)
+        elif request_dto.reference_video:
+            all_ref_videos.append(request_dto.reference_video)
+
+        for ref in all_ref_videos:
             if ref.type == "media_item":
                 source_media_items.append(
                     SourceMediaItemLink(
